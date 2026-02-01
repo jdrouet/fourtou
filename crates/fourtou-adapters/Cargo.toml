@@ -9,6 +9,7 @@ description = "Source and export adapters for Fourtou"
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+fourtou-app.workspace = true
 fourtou-domain.workspace = true
 futures = { workspace = true, features = ["alloc"] }
 thiserror.workspace = true

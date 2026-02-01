@@ -289,6 +289,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "fourtou-app",
  "fourtou-domain",
  "futures",
  "http-body-util",
