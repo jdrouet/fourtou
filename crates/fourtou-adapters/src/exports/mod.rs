@@ -6,26 +6,26 @@ mod http_server;
 #[cfg(feature = "http-export")]
 pub use http_server::{HttpExporter, HttpExporterConfig, SourceMapping};
 
-use fourtou_domain::{DomainError, Exporter, SourceReader};
+use fourtou_domain::{DomainError, Exporter, FileAggregator};
 
 /// Enum dispatch for different export types.
 ///
 /// This enum provides static dispatch for all supported export adapters,
 /// avoiding the need for `dyn` trait objects while still allowing runtime
 /// selection of export types based on configuration.
-pub enum AnyExporter<S: SourceReader> {
+pub enum AnyExporter<A: FileAggregator> {
     /// HTTP server export.
     #[cfg(feature = "http-export")]
-    Http(HttpExporter<S>),
+    Http(HttpExporter<A>),
 
     /// Placeholder for Samba export (not yet implemented).
-    SambaPlaceholder(std::marker::PhantomData<S>),
+    SambaPlaceholder(std::marker::PhantomData<A>),
 
     /// Placeholder for NFS export (not yet implemented).
-    NfsPlaceholder(std::marker::PhantomData<S>),
+    NfsPlaceholder(std::marker::PhantomData<A>),
 }
 
-impl<S: SourceReader> std::fmt::Debug for AnyExporter<S> {
+impl<A: FileAggregator> std::fmt::Debug for AnyExporter<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(feature = "http-export")]
@@ -36,7 +36,7 @@ impl<S: SourceReader> std::fmt::Debug for AnyExporter<S> {
     }
 }
 
-impl<S: SourceReader + 'static> Exporter for AnyExporter<S> {
+impl<A: FileAggregator + 'static> Exporter for AnyExporter<A> {
     async fn serve(&self) -> Result<(), DomainError> {
         match self {
             #[cfg(feature = "http-export")]
@@ -61,11 +61,12 @@ impl<S: SourceReader + 'static> Exporter for AnyExporter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fourtou_app::FileAggregatorService;
     use fourtou_domain::ports::test_support::InMemorySource;
 
     #[tokio::test]
     async fn should_return_not_implemented_error_when_using_placeholder_exporter() {
-        let exporter: AnyExporter<InMemorySource> =
+        let exporter: AnyExporter<FileAggregatorService<InMemorySource>> =
             AnyExporter::SambaPlaceholder(std::marker::PhantomData);
         let result = exporter.serve().await;
         assert!(matches!(result, Err(DomainError::SourceNotFound(_))));

@@ -1,7 +1,7 @@
 //! HTTP server export adapter.
 //!
 //! This adapter serves files from sources over HTTP using axum,
-//! routing requests through the `FileAggregatorService`.
+//! routing requests through the `FileAggregator` port.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -14,8 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use fourtou_app::FileAggregatorService;
-use fourtou_domain::{DomainError, Exporter, FileEntry, FileType, SourceReader};
+use fourtou_domain::{DomainError, Exporter, FileAggregator, FileEntry, FileType};
 use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -48,25 +47,25 @@ pub struct SourceMapping {
 }
 
 /// Shared state for the HTTP server handlers.
-struct AppState<S: SourceReader> {
-    /// The file aggregator service.
-    aggregator: Arc<FileAggregatorService<S>>,
+struct AppState<A: FileAggregator> {
+    /// The file aggregator.
+    aggregator: Arc<A>,
     /// Maps URL aliases to source IDs.
     alias_to_source: HashMap<String, String>,
 }
 
 /// HTTP server exporter.
 ///
-/// This exporter serves files from sources via the `FileAggregatorService`.
-pub struct HttpExporter<S: SourceReader> {
+/// This exporter serves files from sources via the `FileAggregator` port.
+pub struct HttpExporter<A: FileAggregator> {
     config: HttpExporterConfig,
-    aggregator: Arc<FileAggregatorService<S>>,
+    aggregator: Arc<A>,
     mappings: Vec<SourceMapping>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
-impl<S: SourceReader> std::fmt::Debug for HttpExporter<S> {
+impl<A: FileAggregator> std::fmt::Debug for HttpExporter<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpExporter")
             .field("config", &self.config)
@@ -75,12 +74,12 @@ impl<S: SourceReader> std::fmt::Debug for HttpExporter<S> {
     }
 }
 
-impl<S: SourceReader + 'static> HttpExporter<S> {
+impl<A: FileAggregator + 'static> HttpExporter<A> {
     /// Creates a new HTTP exporter with the given configuration and aggregator.
     #[must_use]
     pub fn new(
         config: HttpExporterConfig,
-        aggregator: Arc<FileAggregatorService<S>>,
+        aggregator: Arc<A>,
         mappings: Vec<SourceMapping>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -125,10 +124,10 @@ impl<S: SourceReader + 'static> HttpExporter<S> {
 
         // Build the router with routes for each source alias
         let app = Router::new()
-            .route("/", get(handle_root::<S>))
+            .route("/", get(handle_root::<A>))
             .route("/{alias}", get(handle_source_root_redirect))
-            .route("/{alias}/", get(handle_source_root::<S>))
-            .route("/{alias}/{*path}", get(handle_path::<S>))
+            .route("/{alias}/", get(handle_source_root::<A>))
+            .route("/{alias}/{*path}", get(handle_path::<A>))
             .with_state(state);
 
         // Apply prefix if configured
@@ -140,7 +139,7 @@ impl<S: SourceReader + 'static> HttpExporter<S> {
     }
 }
 
-impl<S: SourceReader + 'static> Exporter for HttpExporter<S> {
+impl<A: FileAggregator + 'static> Exporter for HttpExporter<A> {
     async fn serve(&self) -> Result<(), DomainError> {
         let router = self.build_router();
 
@@ -176,7 +175,7 @@ impl<S: SourceReader + 'static> Exporter for HttpExporter<S> {
 }
 
 /// Handler for the root path - lists available sources.
-async fn handle_root<S: SourceReader>(State(state): State<Arc<AppState<S>>>) -> Html<String> {
+async fn handle_root<A: FileAggregator>(State(state): State<Arc<AppState<A>>>) -> Html<String> {
     let mut html = String::from(
         r"<!DOCTYPE html>
 <html>
@@ -213,8 +212,8 @@ async fn handle_source_root_redirect(Path(alias): Path<String>) -> Response {
 }
 
 /// Handler for source root path - lists files at root of source.
-async fn handle_source_root<S: SourceReader + 'static>(
-    State(state): State<Arc<AppState<S>>>,
+async fn handle_source_root<A: FileAggregator + 'static>(
+    State(state): State<Arc<AppState<A>>>,
     Path(alias): Path<String>,
     method: Method,
 ) -> Response {
@@ -222,8 +221,8 @@ async fn handle_source_root<S: SourceReader + 'static>(
 }
 
 /// Handler for paths within a source.
-async fn handle_path<S: SourceReader + 'static>(
-    State(state): State<Arc<AppState<S>>>,
+async fn handle_path<A: FileAggregator + 'static>(
+    State(state): State<Arc<AppState<A>>>,
     Path((alias, path)): Path<(String, String)>,
     method: Method,
 ) -> Response {
@@ -237,8 +236,8 @@ async fn handle_path<S: SourceReader + 'static>(
 }
 
 /// Common handler for source paths.
-async fn handle_source_path<S: SourceReader>(
-    state: &AppState<S>,
+async fn handle_source_path<A: FileAggregator>(
+    state: &AppState<A>,
     alias: &str,
     path: &str,
     method: &Method,
@@ -248,38 +247,20 @@ async fn handle_source_path<S: SourceReader>(
     };
 
     // Try to list as directory first via the aggregator
-    match state
-        .aggregator
-        .list_files_from_source(source_id, path)
-        .await
-    {
+    match state.aggregator.list_files(source_id, path).await {
         Ok(entries) => {
             // It's a directory - return listing
             render_directory_listing(alias, path, &entries).into_response()
         }
+        Err(DomainError::FileNotFound { .. } | DomainError::SourceNotFound(_)) => {
+            // Not a directory, try as file
+            serve_file(state.aggregator.as_ref(), source_id, path, method).await
+        }
         Err(err) => {
-            // Check if it's a file not found error (might be a file, not a directory)
-            if is_not_found_error(&err) {
-                // Not a directory, try as file
-                serve_file(&state.aggregator, source_id, path, method).await
-            } else {
-                tracing::error!(error = ?err, path = ?path, "Failed to list directory");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-            }
+            tracing::error!(error = ?err, path = ?path, "Failed to list directory");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         }
     }
-}
-
-/// Checks if an app error indicates a file/path not found.
-const fn is_not_found_error(err: &fourtou_app::AppError) -> bool {
-    matches!(
-        err,
-        fourtou_app::AppError::Domain(DomainError::FileNotFound { .. })
-            | fourtou_app::AppError::AggregationFailed {
-                cause: DomainError::FileNotFound { .. },
-                ..
-            }
-    )
 }
 
 /// Renders an HTML directory listing.
@@ -352,8 +333,8 @@ fn render_directory_listing(alias: &str, path: &str, entries: &[FileEntry]) -> H
 }
 
 /// Serves a file from the aggregator.
-async fn serve_file<S: SourceReader>(
-    aggregator: &FileAggregatorService<S>,
+async fn serve_file<A: FileAggregator>(
+    aggregator: &A,
     source_id: &str,
     path: &str,
     method: &Method,
@@ -361,10 +342,10 @@ async fn serve_file<S: SourceReader>(
     // Get metadata first via the aggregator
     let metadata = match aggregator.get_metadata(source_id, path).await {
         Ok(m) => m,
+        Err(DomainError::FileNotFound { .. } | DomainError::SourceNotFound(_)) => {
+            return (StatusCode::NOT_FOUND, "File not found").into_response();
+        }
         Err(err) => {
-            if is_not_found_error(&err) {
-                return (StatusCode::NOT_FOUND, "File not found").into_response();
-            }
             tracing::error!(error = ?err, path = ?path, "Failed to get file metadata");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
@@ -395,10 +376,10 @@ async fn serve_file<S: SourceReader>(
     // For GET requests, stream the file content via the aggregator
     let stream = match aggregator.read_file(source_id, path).await {
         Ok(s) => s,
+        Err(DomainError::FileNotFound { .. } | DomainError::SourceNotFound(_)) => {
+            return (StatusCode::NOT_FOUND, "File not found").into_response();
+        }
         Err(err) => {
-            if is_not_found_error(&err) {
-                return (StatusCode::NOT_FOUND, "File not found").into_response();
-            }
             tracing::error!(error = ?err, path = ?path, "Failed to read file");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
@@ -516,6 +497,7 @@ mod integration_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use fourtou_app::FileAggregatorService;
     use fourtou_domain::ports::test_support::InMemorySource;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -535,7 +517,7 @@ mod integration_tests {
         Arc::new(FileAggregatorService::new(vec![source]))
     }
 
-    fn create_test_exporter() -> HttpExporter<InMemorySource> {
+    fn create_test_exporter() -> HttpExporter<FileAggregatorService<InMemorySource>> {
         let aggregator = create_test_aggregator();
         let config = HttpExporterConfig::default();
         let mappings = vec![SourceMapping {
