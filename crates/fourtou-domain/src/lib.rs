@@ -12,4 +12,4 @@ pub mod ports;
 
 pub use entities::{FileEntry, FileMetadata, FileStream, FileType, SourceId};
 pub use errors::DomainError;
-pub use ports::{Exporter, SourceReader};
+pub use ports::{Exporter, FileAggregator, SourceReader};
