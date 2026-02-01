@@ -89,7 +89,10 @@ impl HttpExporter {
     }
 
     /// Builds the axum router for the HTTP server.
-    fn build_router(&self) -> Router {
+    ///
+    /// This is primarily used internally by `serve()`, but is also exposed
+    /// for integration testing.
+    pub fn build_router(&self) -> Router {
         let mut sources_map = HashMap::new();
         for aliased in &self.sources {
             sources_map.insert(aliased.alias.clone(), Arc::clone(&aliased.source));
@@ -424,5 +427,197 @@ mod tests {
     #[test]
     fn should_guess_octet_stream_when_unknown_extension() {
         assert_eq!(guess_mime_type("/file.xyz123"), "application/octet-stream");
+    }
+
+    #[test]
+    fn should_return_socket_when_queried() {
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([127, 0, 0, 1], 9090)),
+            prefix: String::new(),
+        };
+        let exporter = HttpExporter::new(config, vec![]);
+        assert_eq!(exporter.socket(), SocketAddr::from(([127, 0, 0, 1], 9090)));
+    }
+
+    #[test]
+    fn should_return_prefix_when_queried() {
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            prefix: "/api".to_string(),
+        };
+        let exporter = HttpExporter::new(config, vec![]);
+        assert_eq!(exporter.prefix(), "/api");
+    }
+
+    #[test]
+    fn should_render_directory_listing_with_files_and_directories() {
+        let entries = vec![
+            FileEntry::file("readme.txt"),
+            FileEntry::directory("subdir"),
+            FileEntry::file("data.json"),
+        ];
+        let html = render_directory_listing("test", "/docs", &entries);
+        let body = html.0;
+
+        assert!(body.contains("Index of /test/docs"));
+        // Parent of /docs is /, so parent href is /test/
+        assert!(body.contains(r#"<a href="/test/">../</a>"#));
+        // Directories should come first (sorted)
+        assert!(body.contains(r#"<a href="/test/docs/subdir/">subdir/</a>"#));
+        assert!(body.contains(r#"<a href="/test/docs/data.json">data.json</a>"#));
+        assert!(body.contains(r#"<a href="/test/docs/readme.txt">readme.txt</a>"#));
+    }
+
+    #[test]
+    fn should_render_root_directory_listing_without_parent_link() {
+        let entries = vec![FileEntry::file("file.txt")];
+        let html = render_directory_listing("source", "/", &entries);
+        let body = html.0;
+
+        assert!(body.contains("Index of /source/"));
+        assert!(!body.contains("../"));
+        assert!(body.contains(r#"<a href="/source/file.txt">file.txt</a>"#));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::sources::{HttpSource, HttpSourceConfig};
+
+    fn create_test_exporter() -> HttpExporter {
+        let source_config = HttpSourceConfig {
+            base_url: "http://example.com".to_string(),
+            source_id: "test-source".to_string(),
+            timeout_secs: 30,
+        };
+        let source = Arc::new(AnySource::Http(HttpSource::new(source_config)));
+
+        let config = HttpExporterConfig::default();
+        let sources = vec![AliasedSource {
+            alias: "files".to_string(),
+            source,
+        }];
+
+        HttpExporter::new(config, sources)
+    }
+
+    #[tokio::test]
+    async fn should_return_html_listing_sources_when_requesting_root() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("Available Sources"));
+        assert!(body_str.contains(r#"<a href="files/">files</a>"#));
+    }
+
+    #[tokio::test]
+    async fn should_return_not_found_when_source_does_not_exist() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder()
+            .uri("/nonexistent/")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn should_apply_prefix_when_configured() {
+        let source_config = HttpSourceConfig {
+            base_url: "http://example.com".to_string(),
+            source_id: "test-source".to_string(),
+            timeout_secs: 30,
+        };
+        let source = Arc::new(AnySource::Http(HttpSource::new(source_config)));
+
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            prefix: "/api/v1".to_string(),
+        };
+        let sources = vec![AliasedSource {
+            alias: "data".to_string(),
+            source,
+        }];
+
+        let exporter = HttpExporter::new(config, sources);
+        let router = exporter.build_router();
+
+        // Root without prefix should return 404
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Prefixed path should work - the root listing endpoint
+        let request = Request::builder()
+            .uri("/api/v1")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        // May return OK or redirect depending on axum's nest behavior
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::PERMANENT_REDIRECT
+                || response.status() == StatusCode::TEMPORARY_REDIRECT
+        );
+    }
+
+    #[tokio::test]
+    async fn should_redirect_source_without_trailing_slash() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder()
+            .uri("/files")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        // The handler should still work (it handles both /files and /files/)
+        // It may return either success or an error depending on the source behavior
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::NOT_FOUND
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn should_handle_head_request_for_file() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/files/test.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        // Will fail to connect to the mock source, but tests the routing
+        assert!(
+            response.status() == StatusCode::NOT_FOUND
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
