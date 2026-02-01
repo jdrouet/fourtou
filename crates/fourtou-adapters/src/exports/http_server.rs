@@ -1,6 +1,7 @@
 //! HTTP server export adapter.
 //!
-//! This adapter serves files from sources over HTTP using axum.
+//! This adapter serves files from sources over HTTP using axum,
+//! routing requests through the `FileAggregatorService`.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -13,12 +14,11 @@ use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use fourtou_app::FileAggregatorService;
 use fourtou_domain::{DomainError, Exporter, FileEntry, FileType, SourceReader};
 use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-
-use crate::sources::AnySource;
 
 /// Configuration for the HTTP exporter.
 #[derive(Debug, Clone)]
@@ -38,39 +38,56 @@ impl Default for HttpExporterConfig {
     }
 }
 
-/// A source with its alias for routing.
+/// Maps a URL alias to a source ID in the aggregator.
 #[derive(Debug, Clone)]
-pub struct AliasedSource {
+pub struct SourceMapping {
     /// The alias used in URL paths.
     pub alias: String,
-    /// The source reader.
-    pub source: Arc<AnySource>,
+    /// The source ID in the aggregator.
+    pub source_id: String,
 }
 
 /// Shared state for the HTTP server handlers.
-struct AppState {
-    sources: HashMap<String, Arc<AnySource>>,
+struct AppState<S: SourceReader> {
+    /// The file aggregator service.
+    aggregator: Arc<FileAggregatorService<S>>,
+    /// Maps URL aliases to source IDs.
+    alias_to_source: HashMap<String, String>,
 }
 
 /// HTTP server exporter.
 ///
-/// This exporter serves files from source readers over HTTP.
-#[derive(Debug)]
-pub struct HttpExporter {
+/// This exporter serves files from sources via the `FileAggregatorService`.
+pub struct HttpExporter<S: SourceReader> {
     config: HttpExporterConfig,
-    sources: Vec<AliasedSource>,
+    aggregator: Arc<FileAggregatorService<S>>,
+    mappings: Vec<SourceMapping>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
-impl HttpExporter {
-    /// Creates a new HTTP exporter with the given configuration and sources.
+impl<S: SourceReader> std::fmt::Debug for HttpExporter<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpExporter")
+            .field("config", &self.config)
+            .field("mappings", &self.mappings)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: SourceReader + 'static> HttpExporter<S> {
+    /// Creates a new HTTP exporter with the given configuration and aggregator.
     #[must_use]
-    pub fn new(config: HttpExporterConfig, sources: Vec<AliasedSource>) -> Self {
+    pub fn new(
+        config: HttpExporterConfig,
+        aggregator: Arc<FileAggregatorService<S>>,
+        mappings: Vec<SourceMapping>,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             config,
-            sources,
+            aggregator,
+            mappings,
             shutdown_tx,
             shutdown_rx,
         }
@@ -93,23 +110,25 @@ impl HttpExporter {
     /// This is primarily used internally by `serve()`, but is also exposed
     /// for integration testing.
     pub fn build_router(&self) -> Router {
-        let mut sources_map = HashMap::new();
-        for aliased in &self.sources {
-            sources_map.insert(aliased.alias.clone(), Arc::clone(&aliased.source));
-        }
+        let alias_to_source: HashMap<String, String> = self
+            .mappings
+            .iter()
+            .map(|m| (m.alias.clone(), m.source_id.clone()))
+            .collect();
 
         let state = Arc::new(AppState {
-            sources: sources_map,
+            aggregator: Arc::clone(&self.aggregator),
+            alias_to_source,
         });
 
         let prefix = self.config.prefix.trim_end_matches('/');
 
         // Build the router with routes for each source alias
         let app = Router::new()
-            .route("/", get(handle_root))
+            .route("/", get(handle_root::<S>))
             .route("/{alias}", get(handle_source_root_redirect))
-            .route("/{alias}/", get(handle_source_root))
-            .route("/{alias}/{*path}", get(handle_path))
+            .route("/{alias}/", get(handle_source_root::<S>))
+            .route("/{alias}/{*path}", get(handle_path::<S>))
             .with_state(state);
 
         // Apply prefix if configured
@@ -121,7 +140,7 @@ impl HttpExporter {
     }
 }
 
-impl Exporter for HttpExporter {
+impl<S: SourceReader + 'static> Exporter for HttpExporter<S> {
     async fn serve(&self) -> Result<(), DomainError> {
         let router = self.build_router();
 
@@ -132,7 +151,7 @@ impl Exporter for HttpExporter {
         tracing::info!(
             socket = ?self.config.socket,
             prefix = ?self.config.prefix,
-            sources = self.sources.len(),
+            mappings = self.mappings.len(),
             "Starting HTTP exporter"
         );
 
@@ -157,7 +176,7 @@ impl Exporter for HttpExporter {
 }
 
 /// Handler for the root path - lists available sources.
-async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
+async fn handle_root<S: SourceReader>(State(state): State<Arc<AppState<S>>>) -> Html<String> {
     let mut html = String::from(
         r"<!DOCTYPE html>
 <html>
@@ -168,7 +187,7 @@ async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
 ",
     );
 
-    let mut aliases: Vec<_> = state.sources.keys().collect();
+    let mut aliases: Vec<_> = state.alias_to_source.keys().collect();
     aliases.sort();
 
     for alias in aliases {
@@ -194,8 +213,8 @@ async fn handle_source_root_redirect(Path(alias): Path<String>) -> Response {
 }
 
 /// Handler for source root path - lists files at root of source.
-async fn handle_source_root(
-    State(state): State<Arc<AppState>>,
+async fn handle_source_root<S: SourceReader + 'static>(
+    State(state): State<Arc<AppState<S>>>,
     Path(alias): Path<String>,
     method: Method,
 ) -> Response {
@@ -203,8 +222,8 @@ async fn handle_source_root(
 }
 
 /// Handler for paths within a source.
-async fn handle_path(
-    State(state): State<Arc<AppState>>,
+async fn handle_path<S: SourceReader + 'static>(
+    State(state): State<Arc<AppState<S>>>,
     Path((alias, path)): Path<(String, String)>,
     method: Method,
 ) -> Response {
@@ -218,31 +237,49 @@ async fn handle_path(
 }
 
 /// Common handler for source paths.
-async fn handle_source_path(
-    state: &AppState,
+async fn handle_source_path<S: SourceReader>(
+    state: &AppState<S>,
     alias: &str,
     path: &str,
     method: &Method,
 ) -> Response {
-    let Some(source) = state.sources.get(alias) else {
+    let Some(source_id) = state.alias_to_source.get(alias) else {
         return (StatusCode::NOT_FOUND, "Source not found").into_response();
     };
 
-    // Try to list as directory first
-    match source.list_files(path).await {
+    // Try to list as directory first via the aggregator
+    match state
+        .aggregator
+        .list_files_from_source(source_id, path)
+        .await
+    {
         Ok(entries) => {
             // It's a directory - return listing
             render_directory_listing(alias, path, &entries).into_response()
         }
-        Err(DomainError::FileNotFound { .. }) => {
-            // Not a directory, try as file
-            serve_file(source.as_ref(), path, method).await
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, path = ?path, "Failed to list directory");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        Err(err) => {
+            // Check if it's a file not found error (might be a file, not a directory)
+            if is_not_found_error(&err) {
+                // Not a directory, try as file
+                serve_file(&state.aggregator, source_id, path, method).await
+            } else {
+                tracing::error!(error = ?err, path = ?path, "Failed to list directory");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+            }
         }
     }
+}
+
+/// Checks if an app error indicates a file/path not found.
+const fn is_not_found_error(err: &fourtou_app::AppError) -> bool {
+    matches!(
+        err,
+        fourtou_app::AppError::Domain(DomainError::FileNotFound { .. })
+            | fourtou_app::AppError::AggregationFailed {
+                cause: DomainError::FileNotFound { .. },
+                ..
+            }
+    )
 }
 
 /// Renders an HTML directory listing.
@@ -314,16 +351,21 @@ fn render_directory_listing(alias: &str, path: &str, entries: &[FileEntry]) -> H
     Html(html)
 }
 
-/// Serves a file from the source.
-async fn serve_file(source: &AnySource, path: &str, method: &Method) -> Response {
-    // Get metadata first
-    let metadata = match source.get_metadata(path).await {
+/// Serves a file from the aggregator.
+async fn serve_file<S: SourceReader>(
+    aggregator: &FileAggregatorService<S>,
+    source_id: &str,
+    path: &str,
+    method: &Method,
+) -> Response {
+    // Get metadata first via the aggregator
+    let metadata = match aggregator.get_metadata(source_id, path).await {
         Ok(m) => m,
-        Err(DomainError::FileNotFound { .. }) => {
-            return (StatusCode::NOT_FOUND, "File not found").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, path = ?path, "Failed to get file metadata");
+        Err(err) => {
+            if is_not_found_error(&err) {
+                return (StatusCode::NOT_FOUND, "File not found").into_response();
+            }
+            tracing::error!(error = ?err, path = ?path, "Failed to get file metadata");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
@@ -350,14 +392,14 @@ async fn serve_file(source: &AnySource, path: &str, method: &Method) -> Response
         return response.body(Body::empty()).unwrap();
     }
 
-    // For GET requests, stream the file content
-    let stream = match source.read_file(path).await {
+    // For GET requests, stream the file content via the aggregator
+    let stream = match aggregator.read_file(source_id, path).await {
         Ok(s) => s,
-        Err(DomainError::FileNotFound { .. }) => {
-            return (StatusCode::NOT_FOUND, "File not found").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, path = ?path, "Failed to read file");
+        Err(err) => {
+            if is_not_found_error(&err) {
+                return (StatusCode::NOT_FOUND, "File not found").into_response();
+            }
+            tracing::error!(error = ?err, path = ?path, "Failed to read file");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
@@ -439,26 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn should_return_socket_when_queried() {
-        let config = HttpExporterConfig {
-            socket: SocketAddr::from(([127, 0, 0, 1], 9090)),
-            prefix: String::new(),
-        };
-        let exporter = HttpExporter::new(config, vec![]);
-        assert_eq!(exporter.socket(), SocketAddr::from(([127, 0, 0, 1], 9090)));
-    }
-
-    #[test]
-    fn should_return_prefix_when_queried() {
-        let config = HttpExporterConfig {
-            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
-            prefix: "/api".to_string(),
-        };
-        let exporter = HttpExporter::new(config, vec![]);
-        assert_eq!(exporter.prefix(), "/api");
-    }
-
-    #[test]
     fn should_render_directory_listing_with_files_and_directories() {
         let entries = vec![
             FileEntry::file("readme.txt"),
@@ -494,26 +516,56 @@ mod integration_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use fourtou_domain::ports::test_support::InMemorySource;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::sources::{HttpSource, HttpSourceConfig};
+    fn create_test_aggregator() -> Arc<FileAggregatorService<InMemorySource>> {
+        let source = Arc::new(
+            InMemorySource::new("test-source")
+                .with_files("/", vec![FileEntry::file("hello.txt")])
+                .with_content("/hello.txt", "Hello, World!")
+                .with_metadata(
+                    "/hello.txt",
+                    fourtou_domain::FileMetadata::new("/hello.txt")
+                        .with_size(13)
+                        .with_content_type("text/plain".to_string()),
+                ),
+        );
+        Arc::new(FileAggregatorService::new(vec![source]))
+    }
 
-    fn create_test_exporter() -> HttpExporter {
-        let source_config = HttpSourceConfig {
-            base_url: "http://example.com".to_string(),
-            source_id: "test-source".to_string(),
-            timeout_secs: 30,
-        };
-        let source = Arc::new(AnySource::Http(HttpSource::new(source_config)));
-
+    fn create_test_exporter() -> HttpExporter<InMemorySource> {
+        let aggregator = create_test_aggregator();
         let config = HttpExporterConfig::default();
-        let sources = vec![AliasedSource {
+        let mappings = vec![SourceMapping {
             alias: "files".to_string(),
-            source,
+            source_id: "test-source".to_string(),
         }];
 
-        HttpExporter::new(config, sources)
+        HttpExporter::new(config, aggregator, mappings)
+    }
+
+    #[test]
+    fn should_return_socket_when_queried() {
+        let aggregator = create_test_aggregator();
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([127, 0, 0, 1], 9090)),
+            prefix: String::new(),
+        };
+        let exporter = HttpExporter::new(config, aggregator, vec![]);
+        assert_eq!(exporter.socket(), SocketAddr::from(([127, 0, 0, 1], 9090)));
+    }
+
+    #[test]
+    fn should_return_prefix_when_queried() {
+        let aggregator = create_test_aggregator();
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            prefix: "/api".to_string(),
+        };
+        let exporter = HttpExporter::new(config, aggregator, vec![]);
+        assert_eq!(exporter.prefix(), "/api");
     }
 
     #[tokio::test]
@@ -550,43 +602,24 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn should_apply_prefix_when_configured() {
-        let source_config = HttpSourceConfig {
-            base_url: "http://example.com".to_string(),
-            source_id: "test-source".to_string(),
-            timeout_secs: 30,
-        };
-        let source = Arc::new(AnySource::Http(HttpSource::new(source_config)));
-
-        let config = HttpExporterConfig {
-            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
-            prefix: "/api/v1".to_string(),
-        };
-        let sources = vec![AliasedSource {
-            alias: "data".to_string(),
-            source,
-        }];
-
-        let exporter = HttpExporter::new(config, sources);
+    async fn should_list_directory_when_requesting_source_root() {
+        let exporter = create_test_exporter();
         let router = exporter.build_router();
 
-        // Root without prefix should return 404
-        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
-        let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-        // Prefixed path should work - the root listing endpoint
         let request = Request::builder()
-            .uri("/api/v1")
+            .uri("/files/")
             .body(Body::empty())
             .unwrap();
+
         let response = router.oneshot(request).await.unwrap();
-        // May return OK or redirect depending on axum's nest behavior
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::PERMANENT_REDIRECT
-                || response.status() == StatusCode::TEMPORARY_REDIRECT
-        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("Index of /files/"));
+        assert!(body_str.contains("hello.txt"));
     }
 
     #[tokio::test]
@@ -607,22 +640,92 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn should_handle_head_request_for_file() {
+    async fn should_serve_file_content_when_requesting_file() {
         let exporter = create_test_exporter();
         let router = exporter.build_router();
 
         let request = Request::builder()
-            .method("HEAD")
-            .uri("/files/test.txt")
+            .uri("/files/hello.txt")
             .body(Body::empty())
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
 
-        // Will fail to connect to the mock source, but tests the routing
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(body_str, "Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn should_return_headers_only_when_head_request() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/files/hello.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("content-type"));
+
+        // Body should be empty for HEAD requests
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_return_not_found_when_file_does_not_exist() {
+        let exporter = create_test_exporter();
+        let router = exporter.build_router();
+
+        let request = Request::builder()
+            .uri("/files/nonexistent.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn should_apply_prefix_when_configured() {
+        let aggregator = create_test_aggregator();
+        let config = HttpExporterConfig {
+            socket: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            prefix: "/api/v1".to_string(),
+        };
+        let mappings = vec![SourceMapping {
+            alias: "data".to_string(),
+            source_id: "test-source".to_string(),
+        }];
+
+        let exporter = HttpExporter::new(config, aggregator, mappings);
+        let router = exporter.build_router();
+
+        // Root without prefix should return 404
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Prefixed path should work - the root listing endpoint
+        let request = Request::builder()
+            .uri("/api/v1")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        // May return OK or redirect depending on axum's nest behavior
         assert!(
-            response.status() == StatusCode::NOT_FOUND
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::PERMANENT_REDIRECT
+                || response.status() == StatusCode::TEMPORARY_REDIRECT
         );
     }
 }
