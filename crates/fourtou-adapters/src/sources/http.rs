@@ -87,9 +87,9 @@ impl HttpSource {
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| DomainError::ConnectionFailed {
+                .map_err(|err| DomainError::ConnectionFailed {
                     source_id: self.config.source_id.clone(),
-                    cause: e.into(),
+                    cause: err.into(),
                 })?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -108,7 +108,7 @@ impl HttpSource {
         response
             .text()
             .await
-            .map_err(|e| DomainError::Unexpected(e.into()))
+            .map_err(|err| DomainError::Unexpected(err.into()))
     }
 
     /// Parses an HTML index page to extract file entries.
@@ -167,9 +167,9 @@ impl SourceReader for HttpSource {
                 .head(&url)
                 .send()
                 .await
-                .map_err(|e| DomainError::ConnectionFailed {
+                .map_err(|err| DomainError::ConnectionFailed {
                     source_id: self.config.source_id.clone(),
-                    cause: e.into(),
+                    cause: err.into(),
                 })?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -209,9 +209,9 @@ impl SourceReader for HttpSource {
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| DomainError::ConnectionFailed {
+                .map_err(|err| DomainError::ConnectionFailed {
                     source_id: self.config.source_id.clone(),
-                    cause: e.into(),
+                    cause: err.into(),
                 })?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {

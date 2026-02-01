@@ -140,7 +140,7 @@ impl Exporter for HttpExporter {
                 shutdown_rx.changed().await.ok();
             })
             .await
-            .map_err(|e| DomainError::Unexpected(e.into()))?;
+            .map_err(|err| DomainError::Unexpected(err.into()))?;
 
         tracing::info!("HTTP exporter stopped");
         Ok(())
@@ -351,7 +351,8 @@ async fn serve_file(source: &AnySource, path: &str, method: &Method) -> Response
     };
 
     // Convert FileStream to axum Body
-    let body_stream = stream.map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
+    let body_stream =
+        stream.map(|result| result.map_err(|err| std::io::Error::other(err.to_string())));
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::builder().status(StatusCode::OK);
