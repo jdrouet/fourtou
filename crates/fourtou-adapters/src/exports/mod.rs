@@ -4,7 +4,7 @@
 mod http_server;
 
 #[cfg(feature = "http-export")]
-pub use http_server::{HttpExporter, HttpExporterConfig};
+pub use http_server::{AliasedSource, HttpExporter, HttpExporterConfig};
 
 use fourtou_domain::{DomainError, Exporter};
 
