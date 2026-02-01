@@ -22,7 +22,10 @@ mime_guess = { version = "2.0", optional = true }
 reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
 
 [dev-dependencies]
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-test.workspace = true
+tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true
 
 [features]
