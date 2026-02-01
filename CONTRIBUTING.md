@@ -68,12 +68,86 @@ crates/
 └── fourtou-config/    # Configuration parsing
 ```
 
+### Dependency Direction
+
+Dependencies flow inward toward the domain:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      fourtou (binary)                       │
+│                   Wires everything together                 │
+└─────────────────────────────────────────────────────────────┘
+        │                    │                    │
+        ▼                    ▼                    ▼
+┌───────────────┐  ┌─────────────────┐  ┌─────────────────────┐
+│ fourtou-config│  │   fourtou-app   │  │  fourtou-adapters   │
+│    (config)   │  │  (use cases)    │  │ (sources, exports)  │
+└───────────────┘  └─────────────────┘  └─────────────────────┘
+        │                    │                    │
+        └────────────────────┼────────────────────┘
+                             ▼
+              ┌─────────────────────────────┐
+              │       fourtou-domain        │
+              │  (entities, ports, errors)  │
+              └─────────────────────────────┘
+```
+
+**Critical rule**: Adapters depend on domain ports (traits), not on application layer implementations. This ensures:
+- Adapters can be tested with mock implementations
+- Application logic can change without affecting adapters
+- Clean separation of concerns
+
+### Ports and Adapters Pattern
+
+The domain layer defines **ports** (traits) that represent capabilities:
+
+| Port | Purpose | Implemented By |
+|------|---------|----------------|
+| `SourceReader` | Read files from a storage backend | `HttpSource`, `S3Source`, etc. |
+| `Exporter` | Serve files through a protocol | `HttpExporter`, `SambaExporter`, etc. |
+| `FileAggregator` | Aggregate files from multiple sources | `FileAggregatorService` |
+
+**Example flow for HTTP export:**
+
+```
+HTTP Request
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  HttpExporter<A: FileAggregator>  (adapter)                 │
+│  - Generic over FileAggregator trait                        │
+│  - Depends only on domain port, not concrete implementation │
+└─────────────────────────────────────────────────────────────┘
+     │ calls trait methods
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  FileAggregator trait  (domain port)                        │
+│  - list_files(source_id, path)                              │
+│  - get_metadata(source_id, path)                            │
+│  - read_file(source_id, path)                               │
+└─────────────────────────────────────────────────────────────┘
+     │ implemented by
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  FileAggregatorService<S: SourceReader>  (app layer)        │
+│  - Orchestrates multiple sources                            │
+│  - Implements FileAggregator trait                          │
+└─────────────────────────────────────────────────────────────┘
+     │ delegates to
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  SourceReader trait  (domain port)                          │
+│  - Implemented by HttpSource, S3Source, etc.                │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### Key Principles
 
 1. **No `dyn` trait objects** - Use generics and enum dispatch instead
 2. **Domain independence** - The domain crate has no external dependencies
-3. **Ports and Adapters** - Domain defines traits (ports), adapters implement them
-4. **Error handling** - Use `thiserror` for typed errors, `anyhow` for unexpected errors
+3. **Ports and Adapters** - Domain defines traits (ports), adapters depend on traits
+4. **Adapters don't depend on app** - Use domain traits, not concrete services
+5. **Error handling** - Use `thiserror` for typed errors, `anyhow` for unexpected errors
 
 ### Design Principles
 
