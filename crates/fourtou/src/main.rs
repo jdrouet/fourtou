@@ -14,6 +14,9 @@ use fourtou_config::{Config, ExportConfig, SourceConfig};
 use fourtou_domain::Exporter;
 use tracing_subscriber::EnvFilter;
 
+/// Type alias for the aggregator used throughout the application.
+type Aggregator = FileAggregatorService<AnySource>;
+
 /// Builds a source adapter from configuration.
 fn build_source(name: &str, config: &SourceConfig) -> AnySource {
     match config {
@@ -48,8 +51,8 @@ fn build_source(name: &str, config: &SourceConfig) -> AnySource {
 fn build_exporter(
     name: &str,
     config: &ExportConfig,
-    aggregator: &Arc<FileAggregatorService<AnySource>>,
-) -> Result<AnyExporter<AnySource>> {
+    aggregator: &Arc<Aggregator>,
+) -> Result<AnyExporter<Aggregator>> {
     match config {
         ExportConfig::Http(http) => {
             let socket: SocketAddr = http
