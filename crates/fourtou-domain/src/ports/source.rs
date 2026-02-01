@@ -48,7 +48,7 @@ pub trait SourceReader: Send + Sync {
     /// A stream of bytes representing the file content, or an error if the
     /// file cannot be read.
     fn read_file(&self, path: &str)
-        -> impl Future<Output = Result<FileStream, DomainError>> + Send;
+    -> impl Future<Output = Result<FileStream, DomainError>> + Send;
 
     /// Returns the unique identifier of this source.
     fn source_id(&self) -> &SourceId;

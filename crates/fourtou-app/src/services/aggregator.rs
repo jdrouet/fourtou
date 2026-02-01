@@ -92,9 +92,9 @@ where
         source
             .list_files(path)
             .await
-            .map_err(|e| AppError::AggregationFailed {
+            .map_err(|err| AppError::AggregationFailed {
                 source_id: source_id.to_string(),
-                cause: e,
+                cause: err,
             })
     }
 
@@ -117,9 +117,9 @@ where
         source
             .get_metadata(path)
             .await
-            .map_err(|e| AppError::AggregationFailed {
+            .map_err(|err| AppError::AggregationFailed {
                 source_id: source_id.to_string(),
-                cause: e,
+                cause: err,
             })
     }
 
@@ -138,9 +138,9 @@ where
         source
             .read_file(path)
             .await
-            .map_err(|e| AppError::AggregationFailed {
+            .map_err(|err| AppError::AggregationFailed {
                 source_id: source_id.to_string(),
-                cause: e,
+                cause: err,
             })
     }
 

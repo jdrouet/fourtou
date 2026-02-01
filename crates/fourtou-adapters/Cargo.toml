@@ -12,21 +12,26 @@ bytes.workspace = true
 fourtou-domain.workspace = true
 futures = { workspace = true, features = ["alloc"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net"] }
 tracing.workspace = true
 
 # HTTP adapter dependencies
-axum = { workspace = true, optional = true }
+axum = { workspace = true, features = ["tokio", "http1"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+mime_guess = { version = "2.0", optional = true }
 reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
 
 [dev-dependencies]
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-test.workspace = true
+tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true
 
 [features]
 default = ["http-source", "http-export"]
 http-source = ["dep:reqwest"]
-http-export = ["dep:axum"]
+http-export = ["dep:axum", "dep:http-body-util", "dep:mime_guess"]
 
 [lints]
 workspace = true
