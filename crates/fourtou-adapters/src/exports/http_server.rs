@@ -107,7 +107,7 @@ impl HttpExporter {
         // Build the router with routes for each source alias
         let app = Router::new()
             .route("/", get(handle_root))
-            .route("/{alias}", get(handle_source_root))
+            .route("/{alias}", get(handle_source_root_redirect))
             .route("/{alias}/", get(handle_source_root))
             .route("/{alias}/{*path}", get(handle_path))
             .with_state(state);
@@ -182,6 +182,15 @@ async fn handle_root(State(state): State<Arc<AppState>>) -> Html<String> {
     );
 
     Html(html)
+}
+
+/// Handler for source root path without trailing slash - redirects to canonical URL.
+async fn handle_source_root_redirect(Path(alias): Path<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, format!("{alias}/"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Handler for source root path - lists files at root of source.
@@ -592,13 +601,9 @@ mod integration_tests {
 
         let response = router.oneshot(request).await.unwrap();
 
-        // The handler should still work (it handles both /files and /files/)
-        // It may return either success or an error depending on the source behavior
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::NOT_FOUND
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
+        // Should redirect to the canonical URL with trailing slash
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(response.headers().get("location").unwrap(), "files/");
     }
 
     #[tokio::test]
