@@ -1,0 +1,32 @@
+[package]
+name = "fourtou-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Source and export adapters for Fourtou"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+fourtou-domain.workspace = true
+futures = { workspace = true, features = ["alloc"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+# HTTP adapter dependencies
+axum = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
+
+[dev-dependencies]
+tokio-test.workspace = true
+wiremock.workspace = true
+
+[features]
+default = ["http-source", "http-export"]
+http-source = ["dep:reqwest"]
+http-export = ["dep:axum"]
+
+[lints]
+workspace = true
