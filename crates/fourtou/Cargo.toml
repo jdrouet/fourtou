@@ -1,0 +1,24 @@
+[package]
+name = "fourtou"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified data store aggregator - connects storage backends and exposes them through various protocols"
+
+[[bin]]
+name = "fourtou"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+fourtou-adapters.workspace = true
+fourtou-app.workspace = true
+fourtou-config.workspace = true
+fourtou-domain.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[lints]
+workspace = true
