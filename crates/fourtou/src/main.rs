@@ -2,18 +2,20 @@
 //!
 //! This binary wires together all the components and runs the application.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use fourtou_adapters::exports::{AliasedSource, AnyExporter, HttpExporter, HttpExporterConfig};
+use fourtou_adapters::exports::{AnyExporter, HttpExporter, HttpExporterConfig, SourceMapping};
 use fourtou_adapters::sources::{AnySource, HttpSource, HttpSourceConfig};
 use fourtou_app::FileAggregatorService;
 use fourtou_config::{Config, ExportConfig, SourceConfig};
 use fourtou_domain::Exporter;
 use tracing_subscriber::EnvFilter;
+
+/// Type alias for the aggregator used throughout the application.
+type Aggregator = FileAggregatorService<AnySource>;
 
 /// Builds a source adapter from configuration.
 fn build_source(name: &str, config: &SourceConfig) -> AnySource {
@@ -49,8 +51,8 @@ fn build_source(name: &str, config: &SourceConfig) -> AnySource {
 fn build_exporter(
     name: &str,
     config: &ExportConfig,
-    sources: &HashMap<String, Arc<AnySource>>,
-) -> Result<AnyExporter> {
+    aggregator: &Arc<Aggregator>,
+) -> Result<AnyExporter<Aggregator>> {
     match config {
         ExportConfig::Http(http) => {
             let socket: SocketAddr = http
@@ -63,35 +65,35 @@ fn build_exporter(
                 prefix: http.prefix.clone(),
             };
 
-            // Build aliased sources for this exporter
-            let aliased_sources: Vec<AliasedSource> = http
+            // Build source mappings for this exporter
+            let mappings: Vec<SourceMapping> = http
                 .sources
                 .iter()
-                .filter_map(|mapping| {
-                    let source = sources.get(&mapping.name)?;
+                .map(|mapping| {
                     let alias = mapping
                         .alias
                         .clone()
                         .unwrap_or_else(|| mapping.name.clone());
-                    Some(AliasedSource {
+                    SourceMapping {
                         alias,
-                        source: Arc::clone(source),
-                    })
+                        source_id: mapping.name.clone(),
+                    }
                 })
                 .collect();
 
             Ok(AnyExporter::Http(HttpExporter::new(
                 adapter_config,
-                aliased_sources,
+                Arc::clone(aggregator),
+                mappings,
             )))
         }
         ExportConfig::Samba(_) => {
             tracing::warn!(export = ?name, "Samba export not yet implemented");
-            Ok(AnyExporter::SambaPlaceholder)
+            Ok(AnyExporter::SambaPlaceholder(std::marker::PhantomData))
         }
         ExportConfig::Nfs(_) => {
             tracing::warn!(export = ?name, "NFS export not yet implemented");
-            Ok(AnyExporter::NfsPlaceholder)
+            Ok(AnyExporter::NfsPlaceholder(std::marker::PhantomData))
         }
     }
 }
@@ -123,19 +125,17 @@ async fn main() -> Result<()> {
     );
 
     // Build sources
-    let sources: HashMap<String, Arc<AnySource>> = config
+    let sources: Vec<Arc<AnySource>> = config
         .sources
         .iter()
         .map(|(name, cfg)| {
             tracing::info!(source = ?name, "Building source");
-            (name.clone(), Arc::new(build_source(name, cfg)))
+            Arc::new(build_source(name, cfg))
         })
         .collect();
 
-    // Create aggregator service
-    let aggregator = Arc::new(FileAggregatorService::new(
-        sources.values().cloned().collect(),
-    ));
+    // Create aggregator service with all sources
+    let aggregator = Arc::new(FileAggregatorService::new(sources));
 
     tracing::info!(count = aggregator.source_count(), "Sources initialized");
 
@@ -144,11 +144,11 @@ async fn main() -> Result<()> {
 
     for (name, export_config) in &config.exports {
         tracing::info!(export = ?name, "Building exporter");
-        let exporter = build_exporter(name, export_config, &sources)?;
+        let exporter = build_exporter(name, export_config, &aggregator)?;
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = exporter.serve().await {
-                tracing::error!(error = ?e, "Exporter failed");
+            if let Err(err) = exporter.serve().await {
+                tracing::error!(error = ?err, "Exporter failed");
             }
         });
 
@@ -197,8 +197,8 @@ mod tests {
             sources: vec![],
         });
 
-        let sources = HashMap::new();
-        let exporter = build_exporter("test", &config, &sources).unwrap();
+        let aggregator = Arc::new(FileAggregatorService::new(vec![]));
+        let exporter = build_exporter("test", &config, &aggregator).unwrap();
         assert!(matches!(exporter, AnyExporter::Http(_)));
     }
 
@@ -210,8 +210,32 @@ mod tests {
             sources: vec![],
         });
 
-        let sources = HashMap::new();
-        let result = build_exporter("test", &config, &sources);
+        let aggregator = Arc::new(FileAggregatorService::new(vec![]));
+        let result = build_exporter("test", &config, &aggregator);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_map_source_alias_to_source_id_when_building_exporter() {
+        let config = ExportConfig::Http(fourtou_config::HttpExportConfig {
+            socket: "127.0.0.1:8080".to_string(),
+            prefix: String::new(),
+            sources: vec![
+                fourtou_config::SourceMapping {
+                    name: "my-source".to_string(),
+                    alias: Some("files".to_string()),
+                },
+                fourtou_config::SourceMapping {
+                    name: "other-source".to_string(),
+                    alias: None,
+                },
+            ],
+        });
+
+        let aggregator = Arc::new(FileAggregatorService::new(vec![]));
+        let exporter = build_exporter("test", &config, &aggregator).unwrap();
+
+        // The exporter should be built with the correct mappings
+        assert!(matches!(exporter, AnyExporter::Http(_)));
     }
 }

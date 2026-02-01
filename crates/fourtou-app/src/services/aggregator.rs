@@ -3,7 +3,9 @@
 //! This service aggregates files from multiple sources into a unified view.
 
 use crate::errors::AppError;
-use fourtou_domain::{FileEntry, FileMetadata, FileStream, SourceId, SourceReader};
+use fourtou_domain::{
+    DomainError, FileAggregator, FileEntry, FileMetadata, FileStream, SourceId, SourceReader,
+};
 use std::sync::Arc;
 
 /// A file entry with its source information.
@@ -152,8 +154,43 @@ where
 
     /// Returns the IDs of all registered sources.
     #[must_use]
-    pub fn source_ids(&self) -> Vec<&SourceId> {
+    pub fn get_source_ids(&self) -> Vec<&SourceId> {
         self.sources.iter().map(|s| s.source_id()).collect()
+    }
+
+    /// Finds a source by its ID.
+    fn find_source(&self, source_id: &str) -> Result<&Arc<S>, DomainError> {
+        self.sources
+            .iter()
+            .find(|s| s.source_id().as_str() == source_id)
+            .ok_or_else(|| DomainError::SourceNotFound(source_id.to_string()))
+    }
+}
+
+impl<S> FileAggregator for FileAggregatorService<S>
+where
+    S: SourceReader,
+{
+    async fn list_files(&self, source_id: &str, path: &str) -> Result<Vec<FileEntry>, DomainError> {
+        let source = self.find_source(source_id)?;
+        source.list_files(path).await
+    }
+
+    async fn get_metadata(&self, source_id: &str, path: &str) -> Result<FileMetadata, DomainError> {
+        let source = self.find_source(source_id)?;
+        source.get_metadata(path).await
+    }
+
+    async fn read_file(&self, source_id: &str, path: &str) -> Result<FileStream, DomainError> {
+        let source = self.find_source(source_id)?;
+        source.read_file(path).await
+    }
+
+    fn source_ids(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|s| s.source_id().as_str().to_string())
+            .collect()
     }
 }
 
@@ -269,8 +306,39 @@ mod tests {
         let source2 = Arc::new(InMemorySource::new("beta"));
 
         let service = FileAggregatorService::new(vec![source1, source2]);
-        let ids: Vec<&str> = service.source_ids().iter().map(|id| id.as_str()).collect();
+        let ids: Vec<&str> = service
+            .get_source_ids()
+            .iter()
+            .map(|id| id.as_str())
+            .collect();
 
         assert_eq!(ids, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn should_implement_file_aggregator_trait() {
+        use fourtou_domain::FileAggregator;
+
+        let source = Arc::new(
+            InMemorySource::new("test")
+                .with_files("/", vec![FileEntry::file("doc.txt")])
+                .with_metadata(
+                    "/doc.txt",
+                    fourtou_domain::FileMetadata::new("/doc.txt").with_size(42),
+                )
+                .with_content("/doc.txt", "content"),
+        );
+
+        let service = FileAggregatorService::new(vec![source]);
+
+        // Test via trait methods
+        let files = service.list_files("test", "/").await.unwrap();
+        assert_eq!(files.len(), 1);
+
+        let meta = service.get_metadata("test", "/doc.txt").await.unwrap();
+        assert_eq!(meta.size, Some(42));
+
+        let ids = service.source_ids();
+        assert_eq!(ids, vec!["test"]);
     }
 }
