@@ -104,6 +104,18 @@ crates/
    format!("invalid socket address for export '{name}'")
    ```
 
+7. **Error variable naming**: Never use single-letter variable names for errors. Use `err` or `error` instead of `e`. This improves readability and makes the code more searchable.
+
+   ```rust
+   // Good
+   .map_err(|err| DomainError::ConnectionFailed { source: err })
+   if let Err(error) = connection.close() { /* ... */ }
+   
+   // Forbidden
+   .map_err(|e| DomainError::ConnectionFailed { source: e })
+   if let Err(e) = connection.close() { /* ... */ }
+   ```
+
 ### Error Message Formatting
 
 When using `thiserror`, do **not** include `#[source]` errors in the `#[error]` message. This avoids duplication when the error chain is displayed.
