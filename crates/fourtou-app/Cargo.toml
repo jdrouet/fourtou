@@ -1,0 +1,22 @@
+[package]
+name = "fourtou-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Application services and use cases for Fourtou"
+
+[dependencies]
+anyhow.workspace = true
+fourtou-domain.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+fourtou-domain = { workspace = true, features = ["test-support"] }
+futures = { workspace = true, features = ["alloc"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true
